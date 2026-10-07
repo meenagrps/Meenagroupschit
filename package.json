@@ -4,8 +4,8 @@
   "description": "WhatsApp Automation Backend Server for Meena Chitfunds (Official Cloud API)",
   "main": "server.js",
   "scripts": {
-    "start": "node server_3.js",
-    "dev": "node --watch server_3.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
     "dotenv": "^18.0.6",
