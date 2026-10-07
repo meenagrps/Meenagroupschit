@@ -72,7 +72,7 @@ try {
     process.exit(1);
 }
 
-if (!admin.apps.length) {
+if (!admin.apps || admin.apps.length === 0) {
     admin.initializeApp({
         credential: admin.credential.cert(serviceAccount)
     });
