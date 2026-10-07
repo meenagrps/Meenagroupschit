@@ -23,7 +23,8 @@
 const express = require('express');
 const http = require('http');
 const https = require('https');
-const admin = require('firebase-admin');
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
+const { getFirestore, FieldValue, FieldPath } = require('firebase-admin/firestore');
 const path = require('path');
 const fs = require('fs');
 
@@ -72,13 +73,13 @@ try {
     process.exit(1);
 }
 
-if (!admin.apps || admin.apps.length === 0) {
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
+if (getApps().length === 0) {
+    initializeApp({
+        credential: cert(serviceAccount)
     });
 }
 
-const db = admin.firestore();
+const db = getFirestore();
 
 // DUAL STATE MANAGEMENT DOCUMENTS
 const AUTO_STATE_REF = db.collection('system_state').doc('whatsapp_auto_dispatch');
@@ -573,9 +574,9 @@ async function processOneGroup(queueType, STATE_REF) {
         if (!groupSnap.exists) {
             // Clean Wipe: Ghost group removed instantly
             await STATE_REF.update({ 
-                pendingGroups: admin.firestore.FieldValue.arrayRemove(groupId),
-                currentProcessingGroup: admin.firestore.FieldValue.delete(),
-                pendingUsers: admin.firestore.FieldValue.delete()
+                pendingGroups: FieldValue.arrayRemove(groupId),
+                currentProcessingGroup: FieldValue.delete(),
+                pendingUsers: FieldValue.delete()
             }).catch(() => {});
             return;
         }
@@ -588,9 +589,9 @@ async function processOneGroup(queueType, STATE_REF) {
         const allUserIds = memberSnapshot.map(m => m.id);
         if (allUserIds.length === 0) {
             await STATE_REF.update({ 
-                pendingGroups: admin.firestore.FieldValue.arrayRemove(groupId),
-                currentProcessingGroup: admin.firestore.FieldValue.delete(),
-                pendingUsers: admin.firestore.FieldValue.delete()
+                pendingGroups: FieldValue.arrayRemove(groupId),
+                currentProcessingGroup: FieldValue.delete(),
+                pendingUsers: FieldValue.delete()
             }).catch(() => {});
             return;
         }
@@ -598,7 +599,7 @@ async function processOneGroup(queueType, STATE_REF) {
         const idBatches = chunkArray(allUserIds, 30);
         let userRecords = [];
         for (const batch of idBatches) {
-            const userSnap = await db.collection('users').where(admin.firestore.FieldPath.documentId(), 'in', batch).get();
+            const userSnap = await db.collection('users').where(FieldPath.documentId(), 'in', batch).get();
             userSnap.forEach(docSnap => { userRecords.push({ id: docSnap.id, ...docSnap.data() }); });
         }
 
@@ -683,7 +684,7 @@ async function processOneGroup(queueType, STATE_REF) {
                 console.error(`[DISPATCH ERROR] Failed sending to ${item.phone}:`, sendErr.message);
                 failCount++;
             } finally {
-                await STATE_REF.update({ pendingUsers: admin.firestore.FieldValue.arrayRemove(item.id) }).catch(() => {});
+                await STATE_REF.update({ pendingUsers: FieldValue.arrayRemove(item.id) }).catch(() => {});
             }
 
             if (i < filteredDispatchQueue.length - 1) {
@@ -701,9 +702,9 @@ async function processOneGroup(queueType, STATE_REF) {
         if (!globalCancelFlag && !isAutoDispatchPaused && remainingActionable.length === 0) {
             // ZERO JUNK DATA CLEANUP: Hard delete the memory footprint for this group
             await STATE_REF.update({ 
-                pendingGroups: admin.firestore.FieldValue.arrayRemove(groupId),
-                currentProcessingGroup: admin.firestore.FieldValue.delete(),
-                pendingUsers: admin.firestore.FieldValue.delete()
+                pendingGroups: FieldValue.arrayRemove(groupId),
+                currentProcessingGroup: FieldValue.delete(),
+                pendingUsers: FieldValue.delete()
             }).catch(err => console.error("Firebase Finalize Sync Error", err));
 
             if (adminPhone) {
@@ -734,7 +735,7 @@ async function handleChitfundsDispatch(groupId, requesterPhone) {
         }
 
         await MANUAL_STATE_REF.set({
-            pendingGroups: admin.firestore.FieldValue.arrayUnion(groupId)
+            pendingGroups: FieldValue.arrayUnion(groupId)
         }, { merge: true });
 
         await sendFreeTextMessage(requesterPhone, `⏳ *Queued*\nGroup @${groupId} safely injected into the Manual Queue.\n\n*Note:* The Master Engine respects Priority execution. If Auto-Tasks are running, this group will automatically execute once they finish.`);
@@ -756,7 +757,7 @@ async function handleGlobalChitfundsDispatch(requesterPhone) {
 
         const allGroupIds = groupsSnap.docs.map(d => d.id);
         await MANUAL_STATE_REF.set({
-            pendingGroups: admin.firestore.FieldValue.arrayUnion(...allGroupIds)
+            pendingGroups: FieldValue.arrayUnion(...allGroupIds)
         }, { merge: true });
 
         await sendFreeTextMessage(requesterPhone, `🌐 *Global Queue Added*\nAppended all active database groups to the Manual Queue.\n\n*Note:* The Master Engine executes with priority. If system is currently running scheduled auto-tasks, global manual execution will yield until auto-tasks finish.`);
@@ -846,8 +847,8 @@ app.post('/webhook', async (req, res) => {
                         // Hard-delete manual queue on stop to prevent it from ghost-resuming later
                         await MANUAL_STATE_REF.set({
                             pendingGroups: [],
-                            currentProcessingGroup: admin.firestore.FieldValue.delete(),
-                            pendingUsers: admin.firestore.FieldValue.delete()
+                            currentProcessingGroup: FieldValue.delete(),
+                            pendingUsers: FieldValue.delete()
                         }, { merge: true });
 
                         await sendFreeTextMessage(senderPhone, `🛑 *System Halted*\nManual queue cleared. Automated queue paused. Existing tasks are breaking out of loops safely.`);
