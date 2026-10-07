@@ -1,0 +1,21 @@
+{
+  "name": "meena-chitfunds-whatsapp-gateway",
+  "version": "1.0.0",
+  "description": "WhatsApp Automation Backend Server for Meena Chitfunds (Official Cloud API)",
+  "main": "server_3.js",
+  "scripts": {
+    "start": "node server_3.js",
+    "dev": "node --watch server_3.js"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.6",
+    "express": "^4.21.2",
+    "firebase-admin": "^14.5.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "author": "",
+  "license": "UNLICENSED",
+  "private": true
+}
