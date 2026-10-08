@@ -18,6 +18,7 @@
  * 13. Dynamic Admin Phone Engine & Pre-Approved Meta Utility Templates.
  * 14. Verification Handshake (GET /webhook) & Event Listener (POST /webhook).
  * 15. Zero-Read Hourly Engine: In-Memory Cycle Caching completely eliminates redundant reads.
+ * 16. Integrated GST Reporter Engine with Native Cloud PDF Uploader.
  */
 
 const express = require('express');
@@ -27,6 +28,8 @@ const { initializeApp, cert, getApps } = require('firebase-admin/app');
 const { getFirestore, FieldValue, FieldPath } = require('firebase-admin/firestore');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const { performance } = require('perf_hooks');
 
 // --- 1. ENVIRONMENT CONFIGURATION & SECRETS RESOLVER ---
 // Check if local .env exists; if not, seamlessly rely on cloud environment variables (Render / Hugging Face)
@@ -100,38 +103,40 @@ let isAutoDispatchPaused = false;
 let autoDispatchInterval = null;
 
 // ZERO-READ IN-MEMORY CYCLE CACHE
-// Eliminates repetitive hourly Firestore reads when current window is already marked processed
 let cachedWindowKey = null;
+
+// GST GLOBAL STATE
+const HF_API_URL = "https://corporationgoorac-quanai.hf.space/api/generate-bot";
+let isManualGenerating = false;
+const systemTelemetry = { requestsHandled: 0, lastError: null, bootTime: Date.now() };
 
 // Delay Helpers
 const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// SMART INTERRUPTIBLE DELAY FOR SECONDS (Adjusted for Meta Rate Control)
 async function interruptibleWaitSeconds(minSec, maxSec, type = 'DELAY') {
     const ms = Math.floor(Math.random() * ((maxSec * 1000) - (minSec * 1000) + 1)) + (minSec * 1000);
-    const intervals = Math.floor(ms / 1000); // 1-second pulse checks
+    const intervals = Math.floor(ms / 1000);
     for (let i = 0; i < intervals; i++) {
         if (globalCancelFlag || isAutoDispatchPaused) {
             console.log(`[${type}] Sleep interrupted by system flag.`);
-            return true; // Indicates the sleep was interrupted
+            return true;
         }
         await wait(1000);
     }
-    return false; // Completed naturally
+    return false;
 }
 
-// SMART INTERRUPTIBLE DELAY FOR MINUTES (For Group Settle)
 async function interruptibleWaitMinutes(min, max, type = 'DELAY') {
     const ms = Math.floor(Math.random() * ((max * 60000) - (min * 60000) + 1)) + (min * 60000);
-    const intervals = Math.floor(ms / 5000); // 5-second pulse checks
+    const intervals = Math.floor(ms / 5000);
     for (let i = 0; i < intervals; i++) {
         if (globalCancelFlag || isAutoDispatchPaused) {
             console.log(`[${type}] Sleep interrupted by system flag.`);
-            return true; // Indicates the sleep was interrupted
+            return true;
         }
         await wait(5000);
     }
-    return false; // Completed naturally
+    return false;
 }
 
 // Quiet Hours Helper (11:00 PM to 6:00 AM IST)
@@ -139,6 +144,21 @@ function isQuietHours() {
     const istString = new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"});
     const istHour = new Date(istString).getHours();
     return istHour >= 23 || istHour < 6;
+}
+
+// Fetch Helper (Node 26 native)
+async function fetchWithTimeout(resource, options = {}) {
+    const { timeout = 300000 } = options;
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+    try {
+        const response = await fetch(resource, { ...options, signal: controller.signal });
+        clearTimeout(id);
+        return response;
+    } catch (error) {
+        clearTimeout(id);
+        throw error;
+    }
 }
 
 // --- 4. CORE CALCULATION ENGINES ---
@@ -191,7 +211,6 @@ function calculateDueForMonth(targetMonth, startAmount, schedule = []) {
 }
 
 // --- 5. PROFESSIONAL INDIAN PHONE NUMBER SANITIZER ---
-// Standardizes phone numbers to Meta E.164 digits format (e.g., 919876543210)
 function formatIndianPhoneNumber(rawPhone) {
     if (!rawPhone) return null;
     let digits = String(rawPhone).replace(/\D/g, '');
@@ -218,8 +237,6 @@ function chunkArray(array, size) {
 }
 
 // --- 6. OFFICIAL META CLOUD API CLIENT ENGINE ---
-
-// Raw HTTPS caller for Meta WhatsApp Business Cloud API
 function callMetaWhatsAppAPI(payload) {
     return new Promise((resolve, reject) => {
         if (!META_ACCESS_TOKEN || !META_PHONE_NUMBER_ID) {
@@ -262,7 +279,63 @@ function callMetaWhatsAppAPI(payload) {
     });
 }
 
-// Send standard conversational text message (Valid during active 24-hr customer service windows)
+// NATIVE MULTIPART MEDIA UPLOADER (NO EXTERNAL PACKAGES)
+function uploadMediaToMetaNative(buffer, filename, mimeType = 'application/pdf') {
+    return new Promise((resolve, reject) => {
+        if (!META_ACCESS_TOKEN || !META_PHONE_NUMBER_ID) {
+            return reject(new Error('Meta credentials not configured.'));
+        }
+
+        const boundary = '----WhatsAppMediaBoundary' + Date.now().toString(16);
+        let postDataStart = Buffer.from(
+            `--${boundary}\r\n` +
+            `Content-Disposition: form-data; name="messaging_product"\r\n\r\n` +
+            `whatsapp\r\n` +
+            `--${boundary}\r\n` +
+            `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
+            `Content-Type: ${mimeType}\r\n\r\n`
+        );
+        let postDataEnd = Buffer.from(`\r\n--${boundary}--\r\n`);
+        
+        let postDataLength = postDataStart.length + buffer.length + postDataEnd.length;
+
+        const options = {
+            hostname: 'graph.facebook.com',
+            port: 443,
+            path: `/${META_API_VERSION}/${META_PHONE_NUMBER_ID}/media`,
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${META_ACCESS_TOKEN}`,
+                'Content-Type': `multipart/form-data; boundary=${boundary}`,
+                'Content-Length': postDataLength
+            }
+        };
+
+        const req = https.request(options, (res) => {
+            let body = '';
+            res.on('data', (chunk) => body += chunk);
+            res.on('end', () => {
+                try {
+                    const parsed = JSON.parse(body);
+                    if (res.statusCode >= 200 && res.statusCode < 300 && parsed.id) {
+                        resolve(parsed.id);
+                    } else {
+                        reject(new Error(`Meta Media Upload Error (${res.statusCode}): ${parsed.error?.message || body}`));
+                    }
+                } catch (parseErr) {
+                    reject(new Error(`Failed to parse Meta media response: ${body}`));
+                }
+            });
+        });
+
+        req.on('error', (e) => reject(e));
+        req.write(postDataStart);
+        req.write(buffer);
+        req.write(postDataEnd);
+        req.end();
+    });
+}
+
 async function sendFreeTextMessage(toPhone, text) {
     const cleanTo = formatIndianPhoneNumber(toPhone);
     if (!cleanTo) throw new Error(`Invalid recipient phone: ${toPhone}`);
@@ -274,11 +347,27 @@ async function sendFreeTextMessage(toPhone, text) {
         type: 'text',
         text: { preview_url: false, body: text }
     };
-
     return await callMetaWhatsAppAPI(payload);
 }
 
-// Send Pre-Approved Template Message
+async function sendDocumentMessage(toPhone, mediaId, filename, caption = "") {
+    const cleanTo = formatIndianPhoneNumber(toPhone);
+    if (!cleanTo) throw new Error(`Invalid recipient phone: ${toPhone}`);
+
+    const payload = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: cleanTo,
+        type: 'document',
+        document: {
+            id: mediaId,
+            filename: filename,
+            caption: caption
+        }
+    };
+    return await callMetaWhatsAppAPI(payload);
+}
+
 async function sendTemplateMessage(toPhone, templateName, components = []) {
     const cleanTo = formatIndianPhoneNumber(toPhone);
     if (!cleanTo) throw new Error(`Invalid recipient phone: ${toPhone}`);
@@ -294,11 +383,9 @@ async function sendTemplateMessage(toPhone, templateName, components = []) {
             components: components
         }
     };
-
     return await callMetaWhatsAppAPI(payload);
 }
 
-// Template Sender: Participant Payment Reminder
 async function sendParticipantReminderTemplate(toPhone, { groupName, timeline, participantName, breakdown, totalAmount, userId }) {
     const components = [
         {
@@ -344,7 +431,6 @@ https://corporationgoorac.github.io/ChitFunds/#${userId}`;
     }
 }
 
-// Template Sender: Admin Cycle Start Notification
 async function sendAdminCycleStart(adminPhone, cycleName, timestamp, queuedCount) {
     const components = [
         {
@@ -356,7 +442,6 @@ async function sendAdminCycleStart(adminPhone, cycleName, timestamp, queuedCount
             ]
         }
     ];
-
     try {
         return await sendTemplateMessage(adminPhone, 'admin_dispatch_started', components);
     } catch (err) {
@@ -365,7 +450,6 @@ async function sendAdminCycleStart(adminPhone, cycleName, timestamp, queuedCount
     }
 }
 
-// Template Sender: Admin Group Completion Report
 async function sendAdminGroupReport(adminPhone, { groupId, groupName, deliveredCount, failureCount, totalReminded }) {
     const components = [
         {
@@ -379,7 +463,6 @@ async function sendAdminGroupReport(adminPhone, { groupId, groupName, deliveredC
             ]
         }
     ];
-
     try {
         return await sendTemplateMessage(adminPhone, 'admin_group_summary_report', components);
     } catch (err) {
@@ -395,7 +478,68 @@ Group struck from active queue.`;
     }
 }
 
-// Get Admin Phone Target (Supports dynamic Firebase fetch and fallback targets)
+async function sendGSTTemplateMessage(toPhone, mediaId, filename, reportingMonthStr, templateName = 'gst_monthly_report') {
+    const cleanTo = formatIndianPhoneNumber(toPhone);
+    if (!cleanTo) throw new Error(`Invalid recipient phone: ${toPhone}`);
+
+    const payload = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: cleanTo,
+        type: 'template',
+        template: {
+            name: templateName,
+            language: { code: 'en' },
+            components: [
+                {
+                    type: 'header',
+                    parameters: [
+                        {
+                            type: 'document',
+                            document: {
+                                id: mediaId,
+                                filename: filename
+                            }
+                        }
+                    ]
+                },
+                {
+                    type: 'body',
+                    parameters: [
+                        { type: 'text', text: String(reportingMonthStr) }
+                    ]
+                }
+            ]
+        }
+    };
+    return await callMetaWhatsAppAPI(payload);
+}
+
+async function sendGSTComplianceTemplate(toPhone, missingBillsText, templateName = 'gst_compliance_alert') {
+    const cleanTo = formatIndianPhoneNumber(toPhone);
+    if (!cleanTo) throw new Error(`Invalid recipient phone: ${toPhone}`);
+
+    const payload = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: cleanTo,
+        type: 'template',
+        template: {
+            name: templateName,
+            language: { code: 'en' },
+            components: [
+                {
+                    type: 'body',
+                    parameters: [
+                        { type: 'text', text: String(missingBillsText) }
+                    ]
+                }
+            ]
+        }
+    };
+    return await callMetaWhatsAppAPI(payload);
+}
+
 async function getAdminPhoneTarget() {
     try {
         const adminSnap = await db.collection('system_state').doc('admin_settings').get();
@@ -405,7 +549,6 @@ async function getAdminPhoneTarget() {
     } catch (err) {
         console.error('[ADMIN FETCH ERROR]', err);
     }
-
     if (process.env.ADMIN_PHONE) {
         return formatIndianPhoneNumber(process.env.ADMIN_PHONE);
     }
@@ -413,9 +556,6 @@ async function getAdminPhoneTarget() {
 }
 
 // --- 7. THE PRIORITY DISPATCH ENGINE ---
-
-// 7.1 Timer that identifies if the automated batch needs to be injected into the queue
-// ZERO-READ OPTIMIZATION: Bypasses Firestore entirely if the current window has already executed.
 async function checkAndRunAutoDispatch() {
     if (isAutoDispatchPaused || globalCancelFlag) return;
     if (isQuietHours()) return;
@@ -431,21 +571,13 @@ async function checkAndRunAutoDispatch() {
         let fieldName = day <= 15 ? 'lastRunWindow1' : 'lastRunWindow2';
         const expectedWindowKey = `${fieldName}_${monthYear}`;
 
-        // STEP 1: ZERO-READ IN-MEMORY SHORT-CIRCUIT
-        // If memory verifies this window already ran, stop immediately without touching Firestore (0 Reads)
-        if (cachedWindowKey === expectedWindowKey) {
-            return;
-        }
+        if (cachedWindowKey === expectedWindowKey) return;
 
-        // STEP 2: COLD-START VALIDATION (1 Read on first boot or when switching windows)
         const stateSnap = await AUTO_STATE_REF.get();
         const state = stateSnap.exists ? stateSnap.data() : {};
 
-        // If Firestore confirms this cycle was previously completed, cache in memory and exit immediately
         if (state[fieldName] === monthYear) {
             cachedWindowKey = expectedWindowKey;
-            
-            // Check if unfinished groups remained before server restart
             const pending = state.pendingGroups || [];
             const activeGroup = state.currentProcessingGroup;
             if (activeGroup || pending.length > 0) {
@@ -454,7 +586,6 @@ async function checkAndRunAutoDispatch() {
             return;
         }
 
-        // STEP 3: DISPATCH NEW CYCLE (Window has officially switched)
         console.log(`[AUTO-DISPATCH] Triggering new cycle for ${currentWindow} (${monthYear})`);
         const groupsSnap = await db.collection('groups').get();
         const allGroupIds = groupsSnap.docs.map(d => d.id);
@@ -464,7 +595,6 @@ async function checkAndRunAutoDispatch() {
             pendingGroups: allGroupIds
         }, { merge: true });
 
-        // Lock in-memory cache to prevent subsequent hourly checks from executing Firestore reads
         cachedWindowKey = expectedWindowKey;
 
         const adminPhone = await getAdminPhoneTarget();
@@ -477,18 +607,16 @@ async function checkAndRunAutoDispatch() {
             );
         }
         
-        // Spin up the engine
         triggerMasterQueue();
     } catch (err) {
         console.error(`[AUTO-DISPATCH ERROR] Failed to check state:`, err);
     }
 }
 
-// 7.2 The Master Execution Engine (Auto takes Priority over Manual)
 async function triggerMasterQueue() {
     if (isDispatching || isAutoDispatchPaused || globalCancelFlag) return;
     
-    isDispatching = true; // Engage Global Lock
+    isDispatching = true;
     let groupsProcessedThisSession = 0;
 
     try {
@@ -500,7 +628,6 @@ async function triggerMasterQueue() {
                 break;
             }
 
-            // PRIORITY 1: AUTO QUEUE
             let autoState = (await AUTO_STATE_REF.get()).data() || {};
             let autoPending = autoState.pendingGroups || [];
             let autoCurrent = autoState.currentProcessingGroup;
@@ -516,7 +643,6 @@ async function triggerMasterQueue() {
                 continue; 
             }
 
-            // PRIORITY 2: MANUAL QUEUE (Only runs if Auto is 100% finished)
             let manualState = (await MANUAL_STATE_REF.get()).data() || {};
             let manualPending = manualState.pendingGroups || [];
             let manualCurrent = manualState.currentProcessingGroup;
@@ -532,7 +658,6 @@ async function triggerMasterQueue() {
                 continue; 
             }
 
-            // If we reach here, both queues are completely empty
             console.log('[MASTER ENGINE] All queues empty. Entering idle state.');
             if (groupsProcessedThisSession > 0 && !globalCancelFlag && !isAutoDispatchPaused && !isQuietHours()) {
                 const adminPhone = await getAdminPhoneTarget();
@@ -546,11 +671,10 @@ async function triggerMasterQueue() {
     } catch (criticalErr) {
         console.error('[CRITICAL MASTER ENGINE ERROR]:', criticalErr);
     } finally {
-        isDispatching = false; // Release Global Lock
+        isDispatching = false; 
     }
 }
 
-// 7.3 The Singular Processing Logic (Runs cleanly on whichever Ref is passed to it)
 async function processOneGroup(queueType, STATE_REF) {
     const adminPhone = await getAdminPhoneTarget();
     
@@ -560,19 +684,17 @@ async function processOneGroup(queueType, STATE_REF) {
         
         let groupId = state.currentProcessingGroup;
 
-        // Claim the next group if one isn't currently locked
         if (!groupId && state.pendingGroups && state.pendingGroups.length > 0) {
             groupId = state.pendingGroups[0];
             await STATE_REF.set({ currentProcessingGroup: groupId }, { merge: true });
         }
 
-        if (!groupId) return; // Failsafe
+        if (!groupId) return; 
         console.log(`[${queueType}] Processing Group @${groupId}...`);
 
         const groupSnap = await db.collection('groups').doc(groupId).get();
         
         if (!groupSnap.exists) {
-            // Clean Wipe: Ghost group removed instantly
             await STATE_REF.update({ 
                 pendingGroups: FieldValue.arrayRemove(groupId),
                 currentProcessingGroup: FieldValue.delete(),
@@ -646,7 +768,6 @@ async function processOneGroup(queueType, STATE_REF) {
             }
         }
 
-        // LOCK PENDING USERS (Prevents crash duplicates)
         let currentSysState = await STATE_REF.get();
         let sysData = currentSysState.exists ? currentSysState.data() : {};
         
@@ -662,10 +783,9 @@ async function processOneGroup(queueType, STATE_REF) {
         let successCount = 0;
         let failCount = 0;
 
-        // META DISPATCH LOOP (5-10 second safe rate control)
         for (let i = 0; i < filteredDispatchQueue.length; i++) {
             if (globalCancelFlag || isAutoDispatchPaused || isQuietHours()) {
-                return; // Break immediately, preserving precise state
+                return; 
             }
 
             const item = filteredDispatchQueue[i];
@@ -694,13 +814,11 @@ async function processOneGroup(queueType, STATE_REF) {
             }
         }
 
-        // VERIFY GROUP COMPLETION
         let postState = await STATE_REF.get();
         let postPending = postState.exists ? (postState.data().pendingUsers || []) : [];
         let remainingActionable = postPending.filter(id => dispatchQueue.some(item => item.id === id));
 
         if (!globalCancelFlag && !isAutoDispatchPaused && remainingActionable.length === 0) {
-            // ZERO JUNK DATA CLEANUP: Hard delete the memory footprint for this group
             await STATE_REF.update({ 
                 pendingGroups: FieldValue.arrayRemove(groupId),
                 currentProcessingGroup: FieldValue.delete(),
@@ -740,7 +858,7 @@ async function handleChitfundsDispatch(groupId, requesterPhone) {
 
         await sendFreeTextMessage(requesterPhone, `⏳ *Queued*\nGroup @${groupId} safely injected into the Manual Queue.\n\n*Note:* The Master Engine respects Priority execution. If Auto-Tasks are running, this group will automatically execute once they finish.`);
         
-        triggerMasterQueue(); // Call the engine
+        triggerMasterQueue();
     } catch (err) {
         console.error(err);
         await sendFreeTextMessage(requesterPhone, `❌ Error enqueuing command: ${err.message}`).catch(() => {});
@@ -762,16 +880,223 @@ async function handleGlobalChitfundsDispatch(requesterPhone) {
 
         await sendFreeTextMessage(requesterPhone, `🌐 *Global Queue Added*\nAppended all active database groups to the Manual Queue.\n\n*Note:* The Master Engine executes with priority. If system is currently running scheduled auto-tasks, global manual execution will yield until auto-tasks finish.`);
         
-        triggerMasterQueue(); // Call the engine
+        triggerMasterQueue();
     } catch (err) {
         console.error(err);
         await sendFreeTextMessage(requesterPhone, `❌ Error enqueuing global command: ${err.message}`).catch(() => {});
     }
 }
 
-// --- 9. INBOUND WEBHOOK CONTROLLER (META HANDSHAKE & EVENT STREAM) ---
+// --- 8.5 GST REPORTER LOGIC ---
+async function handleManualGSTCommand(senderPhone, match) {
+    if (isManualGenerating) {
+        await sendFreeTextMessage(senderPhone, "⏳ I am already generating a GST report. Please wait a moment.");
+        return;
+    }
 
-// 9.1 Handshake Verification (GET /webhook)
+    isManualGenerating = true;
+    systemTelemetry.requestsHandled++;
+    const _perfStart = performance.now();
+
+    const isForce = !!match[1];
+    const param = match[2] ? match[2].trim() : null;
+
+    try {
+        await sendFreeTextMessage(senderPhone, `⏳ _Connecting to Hugging Face Cloud Engine..._\n_Please wait while the PDF is assembled._`);
+
+        let payload = { force: isForce };
+        if (param) {
+            payload.mode = 'sequence';
+            payload.sequenceNo = param;
+        } else {
+            payload.mode = 'date';
+            const istNow = new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"}));
+            const y = istNow.getFullYear();
+            const m = String(istNow.getMonth() + 1).padStart(2, '0');
+            const lastDay = new Date(y, istNow.getMonth() + 1, 0).getDate();
+            payload.fromDate = `${y}-${m}-01`;
+            payload.toDate = `${y}-${m}-${lastDay}`;
+        }
+
+        console.log(`[SYS-ADVANCED] Outbound API Payload: ${JSON.stringify(payload)}`);
+
+        const response = await fetchWithTimeout(HF_API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            if (response.status === 400) {
+                const errorData = await response.json();
+                let errorMsg = `⚠️ *COMPLIANCE ERROR DETECTED*\nI halted the PDF generation to prevent tax sequence violations.\n\n`;
+                if (errorData.missing && errorData.missing.length > 0) errorMsg += `❌ *Missing Bills:* ${errorData.missing.join(', ')}\n`;
+                if (errorData.duplicates && errorData.duplicates.length > 0) errorMsg += `⚠️ *Duplicates:* ${errorData.duplicates.join(', ')}\n`;
+                errorMsg += `\n_Reply with *Force GST report ${param || ''}* to bypass this safety check._`;
+                await sendFreeTextMessage(senderPhone, errorMsg.trim());
+                return;
+            } else {
+                throw new Error(`Server returned status: ${response.status}`);
+            }
+        }
+
+        const arrayBuffer = await response.arrayBuffer();
+        let pdfBuffer = Buffer.from(arrayBuffer);
+        
+        const filename = `GST_Report_${Date.now()}.pdf`;
+        const caption = isForce 
+            ? "⚠️ *FORCED GST REPORT*\n_This document contains known sequence anomalies._" 
+            : "✅ *GST REPORT GENERATED*\n_Strict sequence validation passed._";
+        
+        const mediaId = await uploadMediaToMetaNative(pdfBuffer, filename, 'application/pdf');
+        await sendDocumentMessage(senderPhone, mediaId, filename, caption);
+
+        const _perfEnd = performance.now();
+        await sendFreeTextMessage(senderPhone, `⚡ _Cloud Generation & Secure Transmission completed in ${((_perfEnd - _perfStart) / 1000).toFixed(2)} seconds._`);
+
+        pdfBuffer = null;
+        if (global.gc) global.gc();
+
+    } catch (error) {
+        console.error("Manual GST Error:", error);
+        let errMsg = error.name === 'AbortError' 
+            ? "⏳ *Timeout Error:* The cloud server took too long to wake up. Please try again." 
+            : `❌ *Error:* Failed to generate PDF. (${error.message})`;
+        await sendFreeTextMessage(senderPhone, errMsg);
+    } finally {
+        isManualGenerating = false;
+    }
+}
+
+async function runAutomatedGSTCheck(isBootUp = false) {
+    try {
+        const istNow = new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Kolkata"}));
+        let targetYear = istNow.getFullYear();
+        let targetMonth = istNow.getMonth(); 
+        
+        const isLastDay = new Date(targetYear, targetMonth + 1, 0).getDate() === istNow.getDate();
+        const isLateNight = istNow.getHours() >= 22; 
+        
+        if (!isBootUp && !(isLastDay && isLateNight)) {
+            return;
+        }
+
+        let reportingMonthStr = "";
+        let isCatchup = false;
+
+        if (isLastDay && isLateNight) {
+            reportingMonthStr = `${targetYear}-${String(targetMonth + 1).padStart(2, '0')}`;
+        } else {
+            let prevMonthDate = new Date(targetYear, targetMonth - 1, 1);
+            reportingMonthStr = `${prevMonthDate.getFullYear()}-${String(prevMonthDate.getMonth() + 1).padStart(2, '0')}`;
+            isCatchup = true;
+        }
+
+        const docRef = db.collection('gst_reporter').doc('status');
+        const docSnap = await docRef.get();
+        let data = docSnap.exists ? docSnap.data() : { currentMonth: "", status: "IDLE", updatedAt: 0 };
+        
+        if (data.currentMonth === reportingMonthStr && data.status === "SENT") return; 
+
+        const lastUpdated = data.updatedAt ? new Date(data.updatedAt) : new Date(0);
+        const minutesSinceUpdate = (istNow - lastUpdated) / (1000 * 60);
+
+        if (data.currentMonth === reportingMonthStr && data.status === "PROCESSING") {
+            if (minutesSinceUpdate < 15) return; 
+            console.log("[SYS] Stale PROCESSING state detected for GST. Assuming crash. Overriding...");
+        }
+
+        await docRef.set({
+            currentMonth: reportingMonthStr,
+            status: "PROCESSING",
+            updatedAt: istNow.toISOString()
+        });
+
+        const adminPhone = await getAdminPhoneTarget();
+        if (!adminPhone) {
+            console.error("[GST] No admin phone configured. Aborting automated run.");
+            return;
+        }
+
+        const [yStr, mStr] = reportingMonthStr.split('-');
+        const y = parseInt(yStr);
+        const m = parseInt(mStr);
+        const lastDayOfTarget = new Date(y, m, 0).getDate();
+        
+        const payload = {
+            mode: 'date',
+            fromDate: `${yStr}-${mStr}-01`,
+            toDate: `${yStr}-${mStr}-${lastDayOfTarget}`,
+            force: false 
+        };
+
+        const response = await fetchWithTimeout(HF_API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            if (response.status === 400) {
+                const errorData = await response.json();
+                let missingStr = "Multiple errors";
+                if (errorData.missing && errorData.missing.length > 0) missingStr = errorData.missing.join(', ');
+                
+                try {
+                    await sendGSTComplianceTemplate(adminPhone, missingStr, 'gst_compliance_alert');
+                } catch (tempErr) {
+                    let fallback = `🚨 *AUTOMATED GST REPORT FAILED*\nCompliance errors found in sequence for ${reportingMonthStr}.\nMissing: ${missingStr}`;
+                    await sendFreeTextMessage(adminPhone, fallback).catch(()=>{});
+                }
+                
+                await docRef.set({ currentMonth: reportingMonthStr, status: "FAILED", updatedAt: new Date().toISOString() });
+                return;
+            } else {
+                throw new Error(`Server returned status: ${response.status}`);
+            }
+        }
+
+        const arrayBuffer = await response.arrayBuffer();
+        let pdfBuffer = Buffer.from(arrayBuffer);
+        const filename = `GST_Report_${reportingMonthStr}.pdf`;
+        
+        const mediaId = await uploadMediaToMetaNative(pdfBuffer, filename, 'application/pdf');
+
+        try {
+            await sendGSTTemplateMessage(adminPhone, mediaId, filename, reportingMonthStr, 'gst_monthly_report');
+        } catch (tempErr) {
+            console.warn(`[FALLBACK NOTICE] Template 'gst_monthly_report' failed. Attempting free-text document fallback.`);
+            const caption = isCatchup 
+                ? `✅ *RECOVERED GST REPORT*\n_This report for ${reportingMonthStr} was missed during an outage and has been automatically recovered._`
+                : `✅ *MONTHLY GST REPORT*\n_Automated delivery for ${reportingMonthStr}._`;
+            await sendDocumentMessage(adminPhone, mediaId, filename, caption);
+        }
+
+        pdfBuffer = null;
+        if (global.gc) global.gc();
+
+        await docRef.set({
+            currentMonth: reportingMonthStr,
+            status: "SENT",
+            updatedAt: new Date().toISOString()
+        });
+        console.log(`[SYS] Automated GST Report for ${reportingMonthStr} successfully delivered.`);
+
+    } catch (error) {
+        console.error("Automated GST System Error:", error);
+        const adminPhone = await getAdminPhoneTarget();
+        if (adminPhone && error.name !== 'AbortError') {
+            await sendFreeTextMessage(adminPhone, `❌ *Automated GST Task Error:* Failed to process report. (${error.message})`).catch(()=>{});
+        }
+        const docRef = db.collection('gst_reporter').doc('status');
+        await docRef.set({
+            status: "FAILED",
+            updatedAt: new Date().toISOString()
+        }, { merge: true });
+    }
+}
+
+// --- 9. INBOUND WEBHOOK CONTROLLER (META HANDSHAKE & EVENT STREAM) ---
 app.get('/webhook', (req, res) => {
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
@@ -786,15 +1111,12 @@ app.get('/webhook', (req, res) => {
     }
 });
 
-// 9.2 Inbound Message Receiver (POST /webhook)
 app.post('/webhook', async (req, res) => {
-    // Immediate acknowledgement to Meta to avoid retry duplication loops
     res.sendStatus(200);
 
     const body = req.body;
     if (body.object !== 'whatsapp_business_account') return;
     
-    // FETCH ADMIN PHONE ONCE PER PAYLOAD (Optimized outside the nested message loop)
     const currentAdminPhone = await getAdminPhoneTarget();
 
     try {
@@ -812,10 +1134,35 @@ app.post('/webhook', async (req, res) => {
                     const senderPhone = formatIndianPhoneNumber(msg.from);
                     console.log(`[INBOUND MESSAGE] Received: "${messageText}" from ${senderPhone}`);
 
-                    // Validate if sender is Authorized Admin
                     const isAuthorized = currentAdminPhone ? (senderPhone === currentAdminPhone) : true;
 
-                    // DYNAMIC ADMIN NUMBER REGISTRATION
+                    // ADVANCED SYS PING
+                    if (messageText.toLowerCase() === 'gst sys ping') {
+                        if (!isAuthorized) return;
+                        const mem = process.memoryUsage();
+                        const uptime = ((Date.now() - systemTelemetry.bootTime) / 60000).toFixed(2);
+                        const load = os.loadavg()[0].toFixed(2);
+                        const reply = `⚙️ *ADVANCED SYSTEM DIAGNOSTICS*\n\n` +
+                            `⏱️ *Uptime:* ${uptime} min\n` +
+                            `🧠 *RAM (Heap):* ${(mem.heapUsed / 1024 / 1024).toFixed(2)} MB\n` +
+                            `🖥️ *CPU Load (1m):* ${load}\n` +
+                            `🔒 *Process Lock:* ${isManualGenerating ? 'ACTIVE (BUSY)' : 'IDLE (READY)'}\n` +
+                            `📈 *Reports Served:* ${systemTelemetry.requestsHandled}`;
+                        await sendFreeTextMessage(senderPhone, reply);
+                        return;
+                    }
+
+                    // GST MANUAL COMMANDS
+                    const gstMatch = messageText.match(/^(force\s+)?gst\s+report(?:\s+(.+))?$/i);
+                    if (gstMatch) {
+                        if (!isAuthorized) {
+                            console.warn(`[SECURITY] Unauthorized GST attempt from ${senderPhone}`);
+                            return;
+                        }
+                        await handleManualGSTCommand(senderPhone, gstMatch);
+                        return;
+                    }
+
                     const adminRegex = /^(?:chitfunds\s+)?change admin number\s+(.+)$/i;
                     const adminMatch = messageText.match(adminRegex);
                     if (adminMatch && adminMatch[1]) {
@@ -839,12 +1186,10 @@ app.post('/webhook', async (req, res) => {
                         return;
                     }
 
-                    // EMERGENCY KILL-SWITCH
                     if (messageText.toLowerCase() === 'chitfunds stop') {
                         globalCancelFlag = true;
                         isAutoDispatchPaused = true;
                         
-                        // Hard-delete manual queue on stop to prevent it from ghost-resuming later
                         await MANUAL_STATE_REF.set({
                             pendingGroups: [],
                             currentProcessingGroup: FieldValue.delete(),
@@ -855,7 +1200,6 @@ app.post('/webhook', async (req, res) => {
                         return;
                     }
 
-                    // PAUSE / RESUME BACKGROUND AUTO-SENDER
                     if (messageText.toLowerCase() === 'chitfunds pause') {
                         isAutoDispatchPaused = true;
                         await sendFreeTextMessage(senderPhone, `⏸ *System Paused*\nThe Master Queue will not execute any groups until resumed.`);
@@ -868,12 +1212,11 @@ app.post('/webhook', async (req, res) => {
                             await sendFreeTextMessage(senderPhone, `▶️ *System Resumed*\nHowever, Quiet Hours (11 PM - 6 AM) are active. Master Queue will run at 6:00 AM.`);
                         } else {
                             await sendFreeTextMessage(senderPhone, `▶️ *System Resumed*\nChecking Master Queue priorities...`);
-                            triggerMasterQueue(); // Kick off the master engine
+                            triggerMasterQueue(); 
                         }
                         return;
                     }
 
-                    // GLOBAL DISPATCH TRIGGER (MANUAL)
                     if (messageText.toLowerCase() === 'chitfunds all' || messageText.toLowerCase() === 'auto chitfunds all') {
                         console.log(`[TRIGGER] Received GLOBAL Chitfunds command from ${senderPhone}`);
                         globalCancelFlag = false;
@@ -881,7 +1224,6 @@ app.post('/webhook', async (req, res) => {
                         return;
                     }
 
-                    // SINGLE GROUP DISPATCH TRIGGER (MANUAL)
                     const triggerRegex = /^chitfunds\s+([A-Za-z0-9_-]+)/i;
                     const match = messageText.match(triggerRegex);
 
@@ -1016,7 +1358,7 @@ app.get('/', (req, res) => {
     <div style="text-align: left; margin-top: 16px;">
       <div style="font-size: 11px; text-transform: uppercase; font-weight: 800; color: var(--text-muted); margin-bottom: 6px;">Trigger Syntax</div>
       <div class="command-box" style="margin-bottom: 8px;">Chitfunds &lt;groupId&gt; <span style="float:right; font-size: 11px; color: var(--text-muted);">Single Group</span></div>
-      <div class="command-box" style="margin-bottom: 8px;">Chitfunds all <span style="float:right; font-size: 11px; color: var(--text-muted);">Global Auto-Run</span></div>
+      <div class="command-box" style="margin-bottom: 8px;">gst report <span style="float:right; font-size: 11px; color: var(--text-muted);">GST Fetch</span></div>
       <div class="command-box">Chitfunds stop <span style="float:right; font-size: 11px; color: var(--danger-color);">Kill Switch</span></div>
     </div>
   </div>
@@ -1061,9 +1403,13 @@ server.listen(PORT, () => {
     console.log(`[HTTP] Webhook Verification Route: GET /webhook`);
     console.log(`[HTTP] Webhook Inbound Message Route: POST /webhook`);
 
-    // Initialize the automated cron runner
+    // Initialize Chit Funds Cron
     if (!autoDispatchInterval) {
         autoDispatchInterval = setInterval(checkAndRunAutoDispatch, 60 * 60 * 1000);
         checkAndRunAutoDispatch(); 
     }
+
+    // Initialize GST Checkers
+    setInterval(() => runAutomatedGSTCheck(false), 600000); 
+    setTimeout(() => runAutomatedGSTCheck(true), 45000); 
 });
