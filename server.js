@@ -1039,13 +1039,23 @@ async function runAutomatedGSTCheck(isBootUp = false) {
         if (!response.ok) {
             if (response.status === 400) {
                 const errorData = await response.json();
-                let missingStr = "Multiple errors";
-                if (errorData.missing && errorData.missing.length > 0) missingStr = errorData.missing.join(', ');
+                
+                // Combine missing and duplicates into a single string for the template variable
+                let errorDetailsList = [];
+                if (errorData.missing && errorData.missing.length > 0) {
+                    errorDetailsList.push(`Missing: ${errorData.missing.join(', ')}`);
+                }
+                if (errorData.duplicates && errorData.duplicates.length > 0) {
+                    errorDetailsList.push(`Duplicates: ${errorData.duplicates.join(', ')}`);
+                }
+                
+                let combinedErrorStr = errorDetailsList.length > 0 ? errorDetailsList.join(' | ') : "Multiple sequence errors";
                 
                 try {
-                    await sendGSTComplianceTemplate(adminPhone, missingStr, 'gst_compliance_alert');
+                    // Send the combined string as the {{1}} variable
+                    await sendGSTComplianceTemplate(adminPhone, combinedErrorStr, 'gst_compliance_alert');
                 } catch (tempErr) {
-                    let fallback = `🚨 *AUTOMATED GST REPORT FAILED*\nCompliance errors found in sequence for ${reportingMonthStr}.\nMissing: ${missingStr}`;
+                    let fallback = `🚨 *AUTOMATED GST REPORT FAILED*\nCompliance errors found in sequence for ${reportingMonthStr}.\nDetails: ${combinedErrorStr}`;
                     await sendFreeTextMessage(adminPhone, fallback).catch(()=>{});
                 }
                 
