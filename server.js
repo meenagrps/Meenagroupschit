@@ -1145,13 +1145,24 @@ app.post('/webhook', async (req, res) => {
                 if (!value || !value.messages) continue;
 
                 for (const msg of value.messages) {
+                    if (msg.type !== 'text' && msg.type !== 'interactive') continue;
+
+                    const senderPhone = formatIndianPhoneNumber(msg.from);
+                    const isAuthorized = currentAdminPhone ? (senderPhone === currentAdminPhone) : true;
+
+                    // --- NEW INTERACTIVE BUTTON HANDLER ---
+                    if (msg.type === 'interactive' && msg.interactive?.button_reply?.id === 'get_admin_contact') {
+                        console.log(`[INBOUND] Contact button clicked by ${senderPhone}`);
+                        const adminNum = cachedAdminPhone || "Not Configured";
+                        const replyText = `📞 *Contact Number:*\n+${adminNum}\n\nIndha number-ku call panni pesunga.`;
+                        await sendFreeTextMessage(senderPhone, replyText);
+                        continue;
+                    }
+
                     if (msg.type !== 'text') continue;
 
                     const messageText = (msg.text?.body || '').trim();
-                    const senderPhone = formatIndianPhoneNumber(msg.from);
                     console.log(`[INBOUND MESSAGE] Received: "${messageText}" from ${senderPhone}`);
-
-                    const isAuthorized = currentAdminPhone ? (senderPhone === currentAdminPhone) : true;
 
                     // ADVANCED SYS PING
                     if (messageText.toLowerCase() === 'gst sys ping') {
@@ -1201,6 +1212,30 @@ app.post('/webhook', async (req, res) => {
 
                     if (!isAuthorized) {
                         console.warn(`[ACCESS DENIED] Ignoring command from non-admin phone: ${senderPhone}`);
+                        const interactivePayload = {
+                            messaging_product: 'whatsapp',
+                            recipient_type: 'individual',
+                            to: senderPhone,
+                            type: 'interactive',
+                            interactive: {
+                                type: 'button',
+                                body: {
+                                    text: "Idhu automated system, inga chat panna mudiyathu. 🚫\n\nContact pannathuku keela irukka button-a press pannunga. 👇"
+                                },
+                                action: {
+                                    buttons: [
+                                        {
+                                            type: 'reply',
+                                            reply: {
+                                                id: 'get_admin_contact',
+                                                title: 'Contact'
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        };
+                        await callMetaWhatsAppAPI(interactivePayload).catch(err => console.error('[AUTO-REPLY ERROR]', err));
                         return;
                     }
 
