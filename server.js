@@ -1145,12 +1145,13 @@ app.post('/webhook', async (req, res) => {
                 if (!value || !value.messages) continue;
 
                 for (const msg of value.messages) {
-                    if (msg.type !== 'text' && msg.type !== 'interactive') continue;
+                    // Only process messages with types we care about catching
+                    if (!['text', 'interactive', 'image', 'video', 'document', 'audio', 'sticker'].includes(msg.type)) continue;
 
                     const senderPhone = formatIndianPhoneNumber(msg.from);
                     const isAuthorized = currentAdminPhone ? (senderPhone === currentAdminPhone) : true;
 
-                    // --- NEW INTERACTIVE BUTTON HANDLER ---
+                    // 1. Handle the "Contact" Button Click (Anyone can click this)
                     if (msg.type === 'interactive' && msg.interactive?.button_reply?.id === 'get_admin_contact') {
                         console.log(`[INBOUND] Contact button clicked by ${senderPhone}`);
                         const adminNum = cachedAdminPhone || "Not Configured";
@@ -1159,14 +1160,49 @@ app.post('/webhook', async (req, res) => {
                         continue;
                     }
 
+                    // 2. CATCH-ALL FOR UNAUTHORIZED USERS (Text, Image, Audio, Document)
+                    if (!isAuthorized) {
+                        console.warn(`[ACCESS DENIED] Unauthorized message/media from: ${senderPhone}`);
+                        
+                        let warningText = "Idhu automated system, inga chat panna mudiyathu. 🚫\n\nContact pannathuku keela irukka button-a press pannunga. 👇";
+                        
+                        // Switch phrasing if they send any form of media
+                        if (msg.type !== 'text') {
+                            warningText = "Idhu automated system, inga photos/images anuppa mudiyathu. 🚫\n\nNeenga images anuppa, keela irukka button-a press panni admin contact number eduthukonga. 👇";
+                        }
+
+                        const interactivePayload = {
+                            messaging_product: 'whatsapp',
+                            recipient_type: 'individual',
+                            to: senderPhone,
+                            type: 'interactive',
+                            interactive: {
+                                type: 'button',
+                                body: { text: warningText },
+                                action: {
+                                    buttons: [
+                                        {
+                                            type: 'reply',
+                                            reply: { id: 'get_admin_contact', title: 'Contact' }
+                                        }
+                                    ]
+                                }
+                            }
+                        };
+                        await callMetaWhatsAppAPI(interactivePayload).catch(err => console.error('[AUTO-REPLY ERROR]', err));
+                        continue; // Stop processing completely for unauthorized users
+                    }
+
+                    // --- 3. ADMIN ONLY ZONE ---
+                    
+                    // Safe-drop any admin images/media so the server doesn't crash reading msg.text
                     if (msg.type !== 'text') continue;
 
                     const messageText = (msg.text?.body || '').trim();
-                    console.log(`[INBOUND MESSAGE] Received: "${messageText}" from ${senderPhone}`);
+                    console.log(`[INBOUND MESSAGE] Received: "${messageText}" from Admin (${senderPhone})`);
 
                     // ADVANCED SYS PING
                     if (messageText.toLowerCase() === 'gst sys ping') {
-                        if (!isAuthorized) return;
                         const mem = process.memoryUsage();
                         const uptime = ((Date.now() - systemTelemetry.bootTime) / 60000).toFixed(2);
                         const load = os.loadavg()[0].toFixed(2);
@@ -1183,10 +1219,6 @@ app.post('/webhook', async (req, res) => {
                     // GST MANUAL COMMANDS
                     const gstMatch = messageText.match(/^(force\s+)?gst\s+report(?:\s+(.+))?$/i);
                     if (gstMatch) {
-                        if (!isAuthorized) {
-                            console.warn(`[SECURITY] Unauthorized GST attempt from ${senderPhone}`);
-                            return;
-                        }
                         await handleManualGSTCommand(senderPhone, gstMatch);
                         return;
                     }
@@ -1194,10 +1226,6 @@ app.post('/webhook', async (req, res) => {
                     const adminRegex = /^(?:chitfunds\s+)?change admin number\s+(.+)$/i;
                     const adminMatch = messageText.match(adminRegex);
                     if (adminMatch && adminMatch[1]) {
-                        if (!isAuthorized && currentAdminPhone) {
-                            console.warn(`[SECURITY] Unauthorized admin change attempt from ${senderPhone}`);
-                            return;
-                        }
                         const rawPhone = adminMatch[1].trim();
                         const formatted = formatIndianPhoneNumber(rawPhone);
                         if (formatted) {
@@ -1207,35 +1235,6 @@ app.post('/webhook', async (req, res) => {
                         } else {
                             await sendFreeTextMessage(senderPhone, `❌ Invalid phone number format. Please provide a valid 10-digit number.`);
                         }
-                        return;
-                    }
-
-                    if (!isAuthorized) {
-                        console.warn(`[ACCESS DENIED] Ignoring command from non-admin phone: ${senderPhone}`);
-                        const interactivePayload = {
-                            messaging_product: 'whatsapp',
-                            recipient_type: 'individual',
-                            to: senderPhone,
-                            type: 'interactive',
-                            interactive: {
-                                type: 'button',
-                                body: {
-                                    text: "Idhu automated system, inga chat panna mudiyathu. 🚫\n\nContact pannathuku keela irukka button-a press pannunga. 👇"
-                                },
-                                action: {
-                                    buttons: [
-                                        {
-                                            type: 'reply',
-                                            reply: {
-                                                id: 'get_admin_contact',
-                                                title: 'Contact'
-                                            }
-                                        }
-                                    ]
-                                }
-                            }
-                        };
-                        await callMetaWhatsAppAPI(interactivePayload).catch(err => console.error('[AUTO-REPLY ERROR]', err));
                         return;
                     }
 
