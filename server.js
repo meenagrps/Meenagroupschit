@@ -31,6 +31,16 @@ const fs = require('fs');
 const os = require('os');
 const { performance } = require('perf_hooks');
 
+// --- 0. ENTERPRISE TEMPLATE REGISTRY ---
+// Single source of truth for all Meta WhatsApp templates and their specific language codes
+const TEMPLATE_REGISTRY = {
+    PAYMENT_REMINDER: { name: 'chit_payment_due_reminder', language: 'en_GB' },
+    ADMIN_CYCLE_START: { name: 'admin_dispatch_started', language: 'en' },
+    ADMIN_GROUP_REPORT: { name: 'admin_group_summary_report', language: 'en' },
+    GST_MONTHLY_REPORT: { name: 'gst_monthly_report', language: 'en' },
+    GST_COMPLIANCE_ALERT: { name: 'gst_compliance_alert', language: 'en' }
+};
+
 // --- 1. ENVIRONMENT CONFIGURATION & SECRETS RESOLVER ---
 // Check if local .env exists; if not, seamlessly rely on cloud environment variables (Render / Hugging Face)
 const localEnvPath = path.join(__dirname, '.env');
@@ -369,9 +379,12 @@ async function sendDocumentMessage(toPhone, mediaId, filename, caption = "") {
     return await callMetaWhatsAppAPI(payload);
 }
 
-async function sendTemplateMessage(toPhone, templateName, components = []) {
+async function sendTemplateMessage(toPhone, templateKey, components = []) {
     const cleanTo = formatIndianPhoneNumber(toPhone);
     if (!cleanTo) throw new Error(`Invalid recipient phone: ${toPhone}`);
+
+    const templateConfig = TEMPLATE_REGISTRY[templateKey];
+    if (!templateConfig) throw new Error(`Template key '${templateKey}' not found in registry.`);
 
     const payload = {
         messaging_product: 'whatsapp',
@@ -379,8 +392,8 @@ async function sendTemplateMessage(toPhone, templateName, components = []) {
         to: cleanTo,
         type: 'template',
         template: {
-            name: templateName,
-            language: { code: 'en' },
+            name: templateConfig.name,
+            language: { code: templateConfig.language },
             components: components
         }
     };
@@ -410,9 +423,9 @@ async function sendParticipantReminderTemplate(toPhone, { groupName, timeline, p
     ];
 
     try {
-        return await sendTemplateMessage(toPhone, 'chit_payment_due_reminder', components);
+        return await sendTemplateMessage(toPhone, 'PAYMENT_REMINDER', components);
     } catch (err) {
-        console.warn(`[FALLBACK NOTICE] Template 'chit_payment_due_reminder' failed or pending approval (${err.message}). Attempting free-text dispatch fallback.`);
+        console.warn(`[FALLBACK NOTICE] Template 'PAYMENT_REMINDER' failed or pending approval (${err.message}). Attempting free-text dispatch fallback.`);
         const fallbackText = 
 `*Meena Chitfunds*
 Group: ${groupName}
@@ -444,7 +457,7 @@ async function sendAdminCycleStart(adminPhone, cycleName, timestamp, queuedCount
         }
     ];
     try {
-        return await sendTemplateMessage(adminPhone, 'admin_dispatch_started', components);
+        return await sendTemplateMessage(adminPhone, 'ADMIN_CYCLE_START', components);
     } catch (err) {
         const text = `🚀 *Background Auto-Dispatch Started*\nCycle: ${cycleName}\nQueued Groups: ${queuedCount}\nTimestamp: ${timestamp}`;
         return await sendFreeTextMessage(adminPhone, text).catch(() => {});
@@ -465,7 +478,7 @@ async function sendAdminGroupReport(adminPhone, { groupId, groupName, deliveredC
         }
     ];
     try {
-        return await sendTemplateMessage(adminPhone, 'admin_group_summary_report', components);
+        return await sendTemplateMessage(adminPhone, 'ADMIN_GROUP_REPORT', components);
     } catch (err) {
         const report = 
 `✅ *Dispatch Complete: Group @${groupId}*
@@ -479,9 +492,12 @@ Group struck from active queue.`;
     }
 }
 
-async function sendGSTTemplateMessage(toPhone, mediaId, filename, reportingMonthStr, templateName = 'gst_monthly_report') {
+async function sendGSTTemplateMessage(toPhone, mediaId, filename, reportingMonthStr, templateKey = 'GST_MONTHLY_REPORT') {
     const cleanTo = formatIndianPhoneNumber(toPhone);
     if (!cleanTo) throw new Error(`Invalid recipient phone: ${toPhone}`);
+
+    const templateConfig = TEMPLATE_REGISTRY[templateKey];
+    if (!templateConfig) throw new Error(`Template key '${templateKey}' not found in registry.`);
 
     const payload = {
         messaging_product: 'whatsapp',
@@ -489,8 +505,8 @@ async function sendGSTTemplateMessage(toPhone, mediaId, filename, reportingMonth
         to: cleanTo,
         type: 'template',
         template: {
-            name: templateName,
-            language: { code: 'en' },
+            name: templateConfig.name,
+            language: { code: templateConfig.language },
             components: [
                 {
                     type: 'header',
@@ -516,9 +532,12 @@ async function sendGSTTemplateMessage(toPhone, mediaId, filename, reportingMonth
     return await callMetaWhatsAppAPI(payload);
 }
 
-async function sendGSTComplianceTemplate(toPhone, missingBillsText, templateName = 'gst_compliance_alert') {
+async function sendGSTComplianceTemplate(toPhone, missingBillsText, templateKey = 'GST_COMPLIANCE_ALERT') {
     const cleanTo = formatIndianPhoneNumber(toPhone);
     if (!cleanTo) throw new Error(`Invalid recipient phone: ${toPhone}`);
+
+    const templateConfig = TEMPLATE_REGISTRY[templateKey];
+    if (!templateConfig) throw new Error(`Template key '${templateKey}' not found in registry.`);
 
     const payload = {
         messaging_product: 'whatsapp',
@@ -526,8 +545,8 @@ async function sendGSTComplianceTemplate(toPhone, missingBillsText, templateName
         to: cleanTo,
         type: 'template',
         template: {
-            name: templateName,
-            language: { code: 'en' },
+            name: templateConfig.name,
+            language: { code: templateConfig.language },
             components: [
                 {
                     type: 'body',
@@ -1060,7 +1079,7 @@ async function runAutomatedGSTCheck(isBootUp = false) {
                 let combinedErrorStr = errorDetailsList.length > 0 ? errorDetailsList.join(' | ') : "Multiple sequence errors";
                 
                 try {
-                    await sendGSTComplianceTemplate(adminPhone, combinedErrorStr, 'gst_compliance_alert');
+                    await sendGSTComplianceTemplate(adminPhone, combinedErrorStr, 'GST_COMPLIANCE_ALERT');
                 } catch (tempErr) {
                     let fallback = `🚨 *AUTOMATED GST REPORT FAILED*\nCompliance errors found in sequence for ${reportingMonthStr}.\nDetails: ${combinedErrorStr}`;
                     await sendFreeTextMessage(adminPhone, fallback).catch(()=>{});
@@ -1080,9 +1099,9 @@ async function runAutomatedGSTCheck(isBootUp = false) {
         const mediaId = await uploadMediaToMetaNative(pdfBuffer, filename, 'application/pdf');
 
         try {
-            await sendGSTTemplateMessage(adminPhone, mediaId, filename, reportingMonthStr, 'gst_monthly_report');
+            await sendGSTTemplateMessage(adminPhone, mediaId, filename, reportingMonthStr, 'GST_MONTHLY_REPORT');
         } catch (tempErr) {
-            console.warn(`[FALLBACK NOTICE] Template 'gst_monthly_report' failed. Attempting free-text document fallback.`);
+            console.warn(`[FALLBACK NOTICE] Template 'GST_MONTHLY_REPORT' failed. Attempting free-text document fallback.`);
             const caption = isCatchup 
                 ? `✅ *RECOVERED GST REPORT*\n_This report for ${reportingMonthStr} was missed during an outage and has been automatically recovered._`
                 : `✅ *MONTHLY GST REPORT*\n_Automated delivery for ${reportingMonthStr}._`;
