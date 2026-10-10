@@ -758,8 +758,9 @@ async function processOneGroup(queueType, STATE_REF) {
                 if (!targetPhone) continue;
 
                 groupPendingTotal += totalOwed;
-                let breakdownText = "";
-                pendingMonthsList.forEach(pm => { breakdownText += `- Month ${pm.month}: ₹${pm.amount.toLocaleString('en-IN')}\n`; });
+                let breakdownArray = [];
+                pendingMonthsList.forEach(pm => { breakdownArray.push(`Month ${pm.month} (₹${pm.amount.toLocaleString('en-IN')})`); });
+                let breakdownText = breakdownArray.join(', ');
 
                 const participantName = (user.name || 'Participant').toUpperCase();
                 const groupName = (groupData.groupName || groupId).toUpperCase();
