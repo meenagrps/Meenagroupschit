@@ -101,6 +101,7 @@ let isDispatching = false; // Central lock for the Priority Master Queue
 let globalCancelFlag = false; 
 let isAutoDispatchPaused = false; 
 let autoDispatchInterval = null;
+let cachedAdminPhone = null; // ZERO-READ RAM CACHE FOR ADMIN PHONE
 
 // ZERO-READ IN-MEMORY CYCLE CACHE
 let cachedWindowKey = null;
@@ -541,16 +542,23 @@ async function sendGSTComplianceTemplate(toPhone, missingBillsText, templateName
 }
 
 async function getAdminPhoneTarget() {
+    if (cachedAdminPhone) {
+        return cachedAdminPhone;
+    }
+
     try {
         const adminSnap = await db.collection('system_state').doc('admin_settings').get();
         if (adminSnap.exists && adminSnap.data().adminPhone) {
-            return formatIndianPhoneNumber(adminSnap.data().adminPhone);
+            cachedAdminPhone = formatIndianPhoneNumber(adminSnap.data().adminPhone);
+            return cachedAdminPhone;
         }
     } catch (err) {
         console.error('[ADMIN FETCH ERROR]', err);
     }
+    
     if (process.env.ADMIN_PHONE) {
-        return formatIndianPhoneNumber(process.env.ADMIN_PHONE);
+        cachedAdminPhone = formatIndianPhoneNumber(process.env.ADMIN_PHONE);
+        return cachedAdminPhone;
     }
     return null;
 }
@@ -750,9 +758,8 @@ async function processOneGroup(queueType, STATE_REF) {
                 if (!targetPhone) continue;
 
                 groupPendingTotal += totalOwed;
-                let breakdownArray = [];
-                pendingMonthsList.forEach(pm => { breakdownArray.push(`Month ${pm.month} (₹${pm.amount.toLocaleString('en-IN')})`); });
-                let breakdownText = breakdownArray.join(', ');
+                let breakdownText = "";
+                pendingMonthsList.forEach(pm => { breakdownText += `- Month ${pm.month}: ₹${pm.amount.toLocaleString('en-IN')}\n`; });
 
                 const participantName = (user.name || 'Participant').toUpperCase();
                 const groupName = (groupData.groupName || groupId).toUpperCase();
@@ -1041,7 +1048,6 @@ async function runAutomatedGSTCheck(isBootUp = false) {
             if (response.status === 400) {
                 const errorData = await response.json();
                 
-                // Combine missing and duplicates into a single string for the template variable
                 let errorDetailsList = [];
                 if (errorData.missing && errorData.missing.length > 0) {
                     errorDetailsList.push(`Missing: ${errorData.missing.join(', ')}`);
@@ -1053,7 +1059,6 @@ async function runAutomatedGSTCheck(isBootUp = false) {
                 let combinedErrorStr = errorDetailsList.length > 0 ? errorDetailsList.join(' | ') : "Multiple sequence errors";
                 
                 try {
-                    // Send the combined string as the {{1}} variable
                     await sendGSTComplianceTemplate(adminPhone, combinedErrorStr, 'gst_compliance_alert');
                 } catch (tempErr) {
                     let fallback = `🚨 *AUTOMATED GST REPORT FAILED*\nCompliance errors found in sequence for ${reportingMonthStr}.\nDetails: ${combinedErrorStr}`;
@@ -1185,6 +1190,7 @@ app.post('/webhook', async (req, res) => {
                         const formatted = formatIndianPhoneNumber(rawPhone);
                         if (formatted) {
                             await db.collection('system_state').doc('admin_settings').set({ adminPhone: formatted }, { merge: true });
+                            cachedAdminPhone = formatted; // UPDATE RAM CACHE INSTANTLY
                             await sendFreeTextMessage(senderPhone, `✅ Admin number successfully updated to +${formatted}. All future reports will be routed here.`);
                         } else {
                             await sendFreeTextMessage(senderPhone, `❌ Invalid phone number format. Please provide a valid 10-digit number.`);
@@ -1413,6 +1419,11 @@ server.listen(PORT, () => {
     console.log(`[HTTP] Official WhatsApp Cloud Gateway running on http://0.0.0.0:${PORT}`);
     console.log(`[HTTP] Webhook Verification Route: GET /webhook`);
     console.log(`[HTTP] Webhook Inbound Message Route: POST /webhook`);
+
+    // Fetch and cache the Admin phone into RAM immediately on boot
+    getAdminPhoneTarget().then(phone => {
+        console.log(`[SYS] Admin phone cached on startup: +${phone || 'Not Configured'}`);
+    });
 
     // Initialize Chit Funds Cron
     if (!autoDispatchInterval) {
